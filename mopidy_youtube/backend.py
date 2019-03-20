@@ -146,6 +146,8 @@ class YouTubeLibraryProvider(backend.LibraryProvider):
 
 
     def search(self, query=None, uris=None, exact=False, pages=3):
+        return None
+
         if not query:
             return None
 
