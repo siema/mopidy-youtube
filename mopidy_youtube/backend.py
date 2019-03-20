@@ -2,139 +2,67 @@
 
 from __future__ import unicode_literals
 
-import re
-import string
-import unicodedata
+from itertools import chain
 from multiprocessing.pool import ThreadPool
-from urlparse import parse_qs, urlparse
+from collections import OrderedDict
 
 from mopidy import backend
-from mopidy.models import Album, SearchResult, Track
-
-import pafy
+from mopidy.models import Album, SearchResult, Track, Artist
 
 import pykka
-
 import requests
+import re
+import youtube_dl
+
+import HTMLParser
 
 from mopidy_youtube import logger
-
-yt_api_endpoint = 'https://www.googleapis.com/youtube/v3/'
-yt_key = 'AIzaSyAl1Xq9DwdE_KD4AtPaE4EJl3WZe2zCqg4'
-session = requests.Session()
 
 video_uri_prefix = 'youtube:video'
 search_uri = 'youtube:search'
 
+# https://stackoverflow.com/a/2437645
+class LimitedSizeDict(OrderedDict):
+  def __init__(self, *args, **kwds):
+    self.size_limit = kwds.pop("size_limit", None)
+    OrderedDict.__init__(self, *args, **kwds)
+    self._check_size_limit()
 
-def resolve_track(track, stream=False):
-    logger.debug("Resolving YouTube for track '%s'", track)
-    if hasattr(track, 'uri'):
-        return resolve_url(track.comment, stream)
-    else:
-        return resolve_url(track.split('.')[-1], stream)
+  def __setitem__(self, key, value):
+    OrderedDict.__setitem__(self, key, value)
+    self._check_size_limit()
 
+  def _check_size_limit(self):
+    if self.size_limit is not None:
+      while len(self) > self.size_limit:
+        self.popitem(last=False)
 
-def safe_url(uri):
-    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    safe_uri = unicodedata.normalize(
-        'NFKD',
-        unicode(uri)
-    ).encode('ASCII', 'ignore')
-    return re.sub(
-        '\s+',
-        ' ',
-        ''.join(c for c in safe_uri if c in valid_chars)
-    ).strip()
+# https://stackoverflow.com/a/6798042
+class Singleton(type):
+    _instances = {}
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+        return cls._instances[cls]
 
+class YDLCache(object):
+    __metaclass__ = Singleton
 
-def resolve_url(url, stream=False):
-    try:
-        video = pafy.new(url)
-        if not stream:
-            uri = '%s/%s.%s' % (
-                video_uri_prefix, safe_url(video.title), video.videoid)
+    def __init__(self):
+        self._cache = LimitedSizeDict(size_limit=1000)
+
+    def extract_info(self, url, download=True, ie_key=None, extra_info={}, process=True, force_generic_extractor=False):
+        if url in self._cache:
+            logger.debug("Found in cache: '%s'", url)
+            return self._cache[url]
         else:
-            uri = video.getbestaudio()
-            if not uri:  # get video url
-                uri = video.getbest()
-            logger.debug('%s - %s %s %s' % (
-                video.title, uri.bitrate, uri.mediatype, uri.extension))
-            uri = uri.url
-        if not uri:
-            return
-    except Exception as e:
-        # Video is private or doesn't exist
-        logger.info(e.message)
-        return
-
-    images = []
-    if video.bigthumb is not None:
-        images.append(video.bigthumb)
-    if video.bigthumbhd is not None:
-        images.append(video.bigthumbhd)
-
-    track = Track(
-        name=video.title,
-        comment=video.videoid,
-        length=video.length * 1000,
-        album=Album(
-            name='YouTube',
-            images=images
-        ),
-        uri=uri
-    )
-    return track
-
-
-def search_youtube(q):
-    query = {
-        'part': 'id',
-        'maxResults': 15,
-        'type': 'video',
-        'q': q,
-        'key': yt_key
-    }
-    result = session.get(yt_api_endpoint + 'search', params=query)
-    data = result.json()
-
-    resolve_pool = ThreadPool(processes=16)
-    playlist = [item['id']['videoId'] for item in data['items']]
-
-    playlist = resolve_pool.map(resolve_url, playlist)
-    resolve_pool.close()
-    return [item for item in playlist if item]
-
-
-def resolve_playlist(url):
-    resolve_pool = ThreadPool(processes=16)
-    logger.info("Resolving YouTube-Playlist '%s'", url)
-    playlist = []
-
-    page = 'first'
-    while page:
-        params = {
-            'playlistId': url,
-            'maxResults': 50,
-            'key': yt_key,
-            'part': 'contentDetails'
-        }
-        if page and page != "first":
-            logger.debug("Get YouTube-Playlist '%s' page %s", url, page)
-            params['pageToken'] = page
-
-        result = session.get(yt_api_endpoint + 'playlistItems', params=params)
-        data = result.json()
-        page = data.get('nextPageToken')
-
-        for item in data["items"]:
-            video_id = item['contentDetails']['videoId']
-            playlist.append(video_id)
-
-    playlist = resolve_pool.map(resolve_url, playlist)
-    resolve_pool.close()
-    return [item for item in playlist if item]
-
+            ytOpts = {
+                      'format': 'bestaudio/best'
+            }
+            with youtube_dl.YoutubeDL(ytOpts) as ydl:
+                logger.debug("Not found in cache, calling extract_info(): '%s'", url)
+                self._cache[url] = ydl.extract_info(url, download=download, ie_key=ie_key, extra_info=extra_info, process=process, force_generic_extractor=force_generic_extractor)
+                return self._cache[url]
 
 class YouTubeBackend(pykka.ThreadingActor, backend.Backend):
     def __init__(self, config, audio):
@@ -147,57 +75,128 @@ class YouTubeBackend(pykka.ThreadingActor, backend.Backend):
 
 
 class YouTubeLibraryProvider(backend.LibraryProvider):
-    def lookup(self, track):
-        if 'yt:' in track:
-            track = track.replace('yt:', '')
+    PARSER = HTMLParser.HTMLParser()
 
-        if 'youtube.com' in track:
-            url = urlparse(track)
-            req = parse_qs(url.query)
-            if 'list' in req:
-                return resolve_playlist(req.get('list')[0])
-            else:
-                return [item for item in [resolve_url(track)] if item]
+    def _unescape(self, text):
+        return self.PARSER.unescape(text)
+
+    def lookup(self, uri=None):
+        logger.debug("Performing lookup for '%s'", uri)
+        if uri.startswith('yt:'):
+            uri = uri[len('yt:'):]
+        elif uri.startswith('youtube:'):
+            uri = uri[len('youtube:'):]
+
+        ytUri = YDLCache().extract_info(
+            url=uri,
+            download=False
+        )
+
+        if 'entries' in ytUri:  # if playlist
+            videoList = ytUri['entries']
         else:
-            return [item for item in [resolve_track(track)] if item]
+            videoList = [ytUri]
 
-    def search(self, query=None, uris=None, exact=False):
-        # TODO Support exact search
+        result = []
+        for video in videoList:
+            track = Track(
+                name=video['title'],
+                comment=video['description'],
+                length=video['duration'] * 1000,
+                bitrate=video['abr'],
+                artists=[Artist(
+                    name=video['uploader'], 
+#                   uri='https://www.youtube.com/channel/' + video['uploader_id'],
+                )],
+                album=Album(
+                    name='YouTube',
+                    images=[img['url'] for img in video['thumbnails']]
+                ),
+                uri="yt:" + video['webpage_url']
+            )
+            result.append(track)
 
+        return result
+
+    def _fetch_results(self, obj):
+        r = requests.get(obj["url"], params=obj['params'], headers=obj["headers"])
+        regex = r'<a href="/watch\?v=(?P<id>.{11})" class=".*?" data-sessionlink=".*?"  title="(?P<title>.+?)" .+?Duration: (?:(?P<durationHours>[0-9]+):)?(?P<durationMinutes>[0-9]+):(?P<durationSeconds>[0-9]{2}).?</span>.*?<a href="(?P<uploaderUrl>/(?:user|channel)/[^"]+)"[^>]+>(?P<uploader>.*?)</a>.*?<div class="yt-lockup-description[^>]*>(?P<description>.*?)</div>'
+        trackList = []
+        for match in re.finditer(regex, self._unescape(r.text)):
+            length = int(match.group('durationSeconds')) * 1000
+            length += int(match.group('durationMinutes')) * 60 * 1000
+            if match.group('durationHours') != None:
+                length += (int(match.group('durationHours'))) * 60 * 60 * 1000
+            track = Track(
+                name=match.group('title'),
+                comment=match.group('description'),
+                length=length,
+                artists=[Artist(
+                    name=match.group("uploader"),
+    #                            uri='https://www.youtube.com/channel/' + match.group('uploaderUrl')
+                    )],
+                    album=Album(
+                        name='YouTube'
+                    ),
+                uri="yt:https://www.youtube.com/watch?v=%s" % match.group('id')
+            )
+            trackList.append(track)
+            logger.debug("Found '%s'", track.name)
+        return trackList
+
+
+    def search(self, query=None, uris=None, exact=False, pages=3):
         if not query:
-            return
+            return None
 
         if 'uri' in query:
             search_query = ''.join(query['uri'])
-            url = urlparse(search_query)
-            if 'youtube.com' in url.netloc:
-                req = parse_qs(url.query)
-                if 'list' in req:
-                    return SearchResult(
-                        uri=search_uri,
-                        tracks=resolve_playlist(req.get('list')[0])
-                    )
-                else:
-                    logger.info(
-                        "Resolving YouTube for track '%s'", search_query)
-                    return SearchResult(
-                        uri=search_uri,
-                        tracks=[t for t in [resolve_url(search_query)] if t]
-                    )
+            trackList = self.lookup(search_query)
+
         else:
             search_query = ' '.join(query.values()[0])
-            logger.info("Searching YouTube for query '%s'", search_query)
-            return SearchResult(
-                uri=search_uri,
-                tracks=search_youtube(search_query)
-            )
+            if search_query.startswith("https://www.youtube.com/watch?v=") or search_query.startswith("https://youtu.be/"):
+                trackList = self.lookup(search_query)
+            else:
+                logger.info("Searching YouTube for query '%s' and fetching %d pages of results", search_query, pages)
+
+                try:
+                    headers = {"Accept-Language": "en-US,en;q=0.5"}
+                    rs = [{ "url": "https://www.youtube.com/results", "params": { "search_query": search_query, "page": page + 1}, "headers": headers } for page in range(pages)]
+                    results = ThreadPool(pages).imap(self._fetch_results, rs)
+                    trackList = []
+                    for result in results:
+                        trackList.extend(result)
+
+                except Exception as e:
+                    logger.error("Error when searching in youtube: %s", repr(e))
+                    return None
+
+                if len(trackList) == 0:
+                    logger.info("Searching YouTube for query '%s', nothing found", search_query)
+
+        return SearchResult(
+            uri=search_uri,
+            tracks=trackList
+        )
 
 
 class YouTubePlaybackProvider(backend.PlaybackProvider):
-
     def translate_uri(self, uri):
-        track = resolve_track(uri, True)
-        if track is not None:
-            return track.uri
+        logger.debug("Translating uri '%s'", uri)
+        if uri.startswith('yt:'):
+            uri = uri[len('yt:'):]
+        elif uri.startswith('youtube:'):
+            uri = uri[len('youtube:'):]
+
+        ytInfo = YDLCache().extract_info(
+            url=uri,
+            download=False
+        )
+
+        if 'url' in ytInfo:
+            logger.debug("URL '%s'", ytInfo['url'])
+            return ytInfo['url']
         else:
+            logger.debug("URL: None")
             return None
